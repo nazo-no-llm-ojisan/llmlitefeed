@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# 
+docs/private/
+
+# Environment / Secrets
+.env
+.secret_password
+data/secrets.db
+
+# Node (if any)
+node_modules/
+dist/
+
+# Test artifacts
+output_image.png
+output_video.mp4
+
+# IDE
+.vscode/
+*.swp
