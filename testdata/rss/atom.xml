@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Test Atom Feed</title>
+  <link href="https://example.com/atom" rel="self"/>
+  <link href="https://example.com"/>
+  <updated>2026-07-14T12:00:00Z</updated>
+  <author>
+    <name>Test Author</name>
+  </author>
+  <id>https://example.com/atom</id>
+  <entry>
+    <title>Atom First Entry</title>
+    <link href="https://example.com/atom-first"/>
+    <id>https://example.com/atom-first</id>
+    <updated>2026-07-14T10:00:00Z</updated>
+    <summary>This is the first atom entry.</summary>
+  </entry>
+  <entry>
+    <title>Atom Second Entry</title>
+    <link href="https://example.com/atom-second"/>
+    <id>https://example.com/atom-second</id>
+    <updated>2026-07-14T11:00:00Z</updated>
+    <summary>This is the second atom entry.</summary>
+  </entry>
+</feed>
