@@ -9,39 +9,44 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"sync"
 	"time"
 )
 
 const (
 	DefaultTimeout  = 10 * time.Second
 	MaxResponseSize = 10 * 1024 * 1024 // 10 MiB
+	MaxRedirectHops = 10
 )
 
-// Resolver は名前解決を抽象化する。
-type Resolver interface {
-	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
-}
+// DialFunc は addr (host:port) で net.Conn を開く。addr は検証済み IP:port。
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // Fetcher は SSRF セーフな HTTP GET を提供する。
 type Fetcher struct {
-	client   *http.Client
-	resolver func(ctx context.Context, network, host string) ([]netip.Addr, error)
-	timeout  time.Duration
-
-	mu     sync.Mutex
-	ipAddr string // DialContext で接続する検証済み IP:port
+	client      *http.Client
+	resolver    func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	timeout     time.Duration
+	dialContext DialFunc // テスト用 injection seam（非公開）
 }
 
 // New は production 用の Fetcher を返す。
 func New() *Fetcher {
 	resolver := &net.Resolver{}
 	f := &Fetcher{resolver: resolver.LookupNetIP, timeout: DefaultTimeout}
-	transport := &http.Transport{
-		DialContext: f.dialValidated,
-	}
 	f.client = &http.Client{
-		Transport: transport,
+		Timeout: DefaultTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return f
+}
+
+// newWithRoundTripper はテスト用 RoundTripper を持つ Fetcher を返す（internal）。
+func newWithRoundTripper(rt http.RoundTripper, resolver func(ctx context.Context, network, host string) ([]netip.Addr, error)) *Fetcher {
+	f := &Fetcher{resolver: resolver, timeout: DefaultTimeout}
+	f.client = &http.Client{
+		Transport: rt,
 		Timeout:   DefaultTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -50,38 +55,27 @@ func New() *Fetcher {
 	return f
 }
 
-// NewForTest は resolver と RoundTripper を差し替える。
-func NewForTest(rt http.RoundTripper, resolver func(ctx context.Context, network, host string) ([]netip.Addr, error)) *Fetcher {
-	return NewForTestWithTimeout(rt, resolver, DefaultTimeout)
-}
-
-// NewForTestWithTimeout は timeout も差し替える。
-func NewForTestWithTimeout(rt http.RoundTripper, resolver func(ctx context.Context, network, host string) ([]netip.Addr, error), timeout time.Duration) *Fetcher {
-	client := &http.Client{
-		Transport: rt,
-		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+// newWithDial は Dial 関数を injection seam に差し込むテスト用 Fetcher（internal）。
+func newWithDial(dial DialFunc, resolver func(ctx context.Context, network, host string) ([]netip.Addr, error), timeout time.Duration) *Fetcher {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
 	}
-	return &Fetcher{client: client, resolver: resolver, timeout: timeout}
-}
-
-// dialValidated は Fetch で検証済みの IP:port へ dial する。
-// 呼び出しは Fetch が resolver で検証した addr を 1 回だけ保存し、RoundTrip 内 dialer がそれを使う。
-func (f *Fetcher) dialValidated(ctx context.Context, network, _ string) (net.Conn, error) {
-	f.mu.Lock()
-	addr := f.ipAddr
-	f.mu.Unlock()
-	if addr == "" {
-		return nil, errors.New("internal: no validated address")
+	return &Fetcher{
+		resolver:    resolver,
+		timeout:     timeout,
+		dialContext: dial,
 	}
-	d := net.Dialer{Timeout: f.timeout}
-	return d.DialContext(ctx, network, addr)
 }
 
 // Fetch は URL を取得して body を返す。
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
+	return f.fetchWithHops(ctx, rawURL, 0)
+}
+
+func (f *Fetcher) fetchWithHops(ctx context.Context, rawURL string, hops int) (string, error) {
+	if hops >= MaxRedirectHops {
+		return "", fmt.Errorf("too many redirects (%d)", hops)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", fmt.Errorf("parse url: %w", err)
@@ -94,14 +88,12 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 		return "", errors.New("empty host")
 	}
 
-	// 名前解決前の IP リテラル検査
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := checkIP(ip); err != nil {
 			return "", err
 		}
 	}
 
-	// 名前解決して全 IP 検査
 	rctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 	addrs, err := f.resolver(rctx, "ip", host)
@@ -117,7 +109,6 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 		}
 	}
 
-	// 検証済み IP を保存し、Transport の DialContext はそれを必ず使う
 	primary := addrs[0]
 	port := u.Port()
 	if port == "" {
@@ -129,26 +120,24 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 	}
 	addr := net.JoinHostPort(primary.String(), port)
 
-	f.mu.Lock()
-	f.ipAddr = addr
-	f.mu.Unlock()
+	client := f.clientForRequest(addr)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
 	}
-	// req.URL.Host は元ホスト名のまま。TLS SNI に使われる。
-	req.Host = host
 
-	resp, err := f.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("http do: %w", err)
 	}
-	defer resp.Body.Close()
 
 	// 3xx: リダイレクトを再 Fetch（毎回 SSRF 検査をくぐり抜ける）
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		loc := resp.Header.Get("Location")
+		// 次の Fetch に進む前に現在 resp.Body を必ず close する。
+		// 標準 http.body の wrap 後に Close 観測が困難になるため、ここで明示 close する。
+		_ = resp.Body.Close()
 		if loc == "" {
 			return "", fmt.Errorf("redirect %d with empty Location", resp.StatusCode)
 		}
@@ -156,17 +145,10 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse redirect location: %w", err)
 		}
-		next := *u
-		if ref.IsAbs() {
-			next = *ref
-		} else {
-			next.Path = ref.Path
-			if ref.RawQuery != "" {
-				next.RawQuery = ref.RawQuery
-			}
-		}
-		return f.Fetch(ctx, next.String())
+		next := u.ResolveReference(ref)
+		return f.fetchWithHops(ctx, next.String(), hops+1)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("non-2xx status: %d", resp.StatusCode)
@@ -183,13 +165,45 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (string, error) {
 	return string(body), nil
 }
 
+// clientForRequest は各リクエスト用に検証済み addr 専用の *http.Client を返す。
+func (f *Fetcher) clientForRequest(addr string) *http.Client {
+	timeout := f.timeout
+	base := f.client
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if base != nil && base.Transport != nil {
+		client.Transport = base.Transport
+		return client
+	}
+	if f.dialContext != nil {
+		dial := f.dialContext
+		client.Transport = &http.Transport{
+			DialContext: func(dctx context.Context, network, _ string) (net.Conn, error) {
+				return dial(dctx, network, addr)
+			},
+		}
+		return client
+	}
+	fixedAddr := addr
+	client.Transport = &http.Transport{
+		DialContext: func(dctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(dctx, network, fixedAddr)
+		},
+	}
+	return client
+}
+
 // checkIP は IP が SSRF ブロック対象かを判定する。
 func checkIP(ip netip.Addr) error {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
 		return fmt.Errorf("blocked ip: %s", ip)
 	}
-	// IPv4-mapped IPv6 も検査
 	if ip.Is4In6() {
 		v4 := ip.Unmap()
 		if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() || v4.IsUnspecified() {
