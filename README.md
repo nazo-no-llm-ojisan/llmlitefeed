@@ -2,7 +2,7 @@
 
 ローカル / OpenAI互換LLMで、あなた専用のニュースサイトを5秒で。
 
-!["logo"](https://github.com/nazo-no-llm-ojisan/llmlitefeed/blob/main/docs/images/16c863f7-1700-473b-8775-d6fd4485aa1a.jpg?raw=true)
+!["logo"](https://github.com/nazo-no-llm-ojisan/llmlitefeed/blob/main/docs/images/16c863f7-1700-473b-8775-d6fd4485aa1a2.png?raw=true)
 
 バイナリをダウンロードして、クリックで起動。
 
